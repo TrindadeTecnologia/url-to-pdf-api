@@ -3,6 +3,31 @@ const _ = require('lodash');
 const config = require('../config');
 const logger = require('../util/logger')(__filename);
 
+const genericPool = require('generic-pool');
+
+const factory = {
+  async create() {
+    logger.info('Recuperando browser...');
+    return puppeteer.launch({
+      headless: !config.DEBUG_MODE,
+      ignoreHTTPSErrors: true, // opts.ignoreHttpsErrors,
+      args: ['--disable-gpu', '--no-sandbox', '--disable-setuid-sandbox'],
+      sloMo: config.DEBUG_MODE ? 250 : undefined,
+    });
+  },
+  async destroy(browser) {
+    logger.info('Encerrando browser...');
+    await browser.close();
+  },
+};
+
+const poolOpts = {
+  max: 16, // maximum size of the pool
+  min: 4, // minimum size of the pool
+};
+
+const myPool = genericPool.createPool(factory, poolOpts);
+
 async function render(_opts = {}) {
   const opts = _.merge({
     cookies: [],
@@ -29,80 +54,85 @@ async function render(_opts = {}) {
     opts.pdf.format = undefined;
   }
 
-  logOpts(opts);
+  // logOpts(opts);
 
-  const browser = await puppeteer.launch({
-    headless: !config.DEBUG_MODE,
-    ignoreHTTPSErrors: opts.ignoreHttpsErrors,
-    args: ['--disable-gpu', '--no-sandbox', '--disable-setuid-sandbox'],
-    sloMo: config.DEBUG_MODE ? 250 : undefined,
-  });
-  const page = await browser.newPage();
+  const resourcePromise = myPool.acquire();
 
-  page.on('console', (...args) => logger.info('PAGE LOG:', ...args));
+  return resourcePromise
+    .then(async (browser) => {
 
-  page.on('error', (err) => {
-    logger.error(`Error event emitted: ${err}`);
-    logger.error(err.stack);
-    browser.close();
-  });
+      const page = await browser.newPage();
 
-  let data;
-  try {
-    logger.info('Set browser viewport..');
-    await page.setViewport(opts.viewport);
-    if (opts.emulateScreenMedia) {
-      logger.info('Emulate @media screen..');
-      await page.emulateMedia('screen');
-    }
+      page.on('console', (...args) => logger.info('PAGE LOG:', ...args));
 
-    logger.info('Setting cookies..');
-    opts.cookies.map(async (cookie) => {
-      await page.setCookie(cookie);
-    });
+      page.on('error', (err) => {
+        logger.error(`Error event emitted: ${err}`);
+        logger.error(err.stack);
+        browser.close();
+      });
 
-    if (opts.html) {
-      logger.info('Set HTML ..');
-      // https://github.com/GoogleChrome/puppeteer/issues/728
-      await page.goto(`data:text/html,${opts.html}`, opts.goto);
-    } else {
-      logger.info(`Goto url ${opts.url} ..`);
-      await page.goto(opts.url, opts.goto);
-    }
+      let data;
+      try {
+        logger.info('Set browser viewport..');
+        await page.setViewport(opts.viewport);
+        if (opts.emulateScreenMedia) {
+          logger.info('Emulate @media screen..');
+          await page.emulateMedia('screen');
+        }
 
-    if (_.isNumber(opts.waitFor) || _.isString(opts.waitFor)) {
-      logger.info(`Wait for ${opts.waitFor} ..`);
-      await page.waitFor(opts.waitFor);
-    }
+        logger.info('Setting cookies..');
+        opts.cookies.map(async (cookie) => {
+          await page.setCookie(cookie);
+        });
 
-    if (opts.scrollPage) {
-      logger.info('Scroll page ..');
-      await scrollPage(page);
-    }
+        if (opts.html) {
+          logger.info('Set HTML ..');
+          // https://github.com/GoogleChrome/puppeteer/issues/728
+          await page.goto(`data:text/html,${opts.html}`, opts.goto);
+        } else {
+          logger.info(`Goto url ${opts.url} ..`);
+          await page.goto(opts.url, opts.goto);
+        }
 
-    logger.info('Render PDF ..');
-    if (config.DEBUG_MODE) {
-      const msg = `\n\n---------------------------------\n
+        if (_.isNumber(opts.waitFor) || _.isString(opts.waitFor)) {
+          logger.info(`Wait for ${opts.waitFor} ..`);
+          await page.waitFor(opts.waitFor);
+        }
+
+        if (opts.scrollPage) {
+          logger.info('Scroll page ..');
+          await scrollPage(page);
+        }
+
+        logger.info('Render PDF ..');
+        if (config.DEBUG_MODE) {
+          const msg = `\n\n---------------------------------\n
         Chrome does not support PDF rendering in "headed" mode.
         See this issue: https://github.com/GoogleChrome/puppeteer/issues/576
         \n---------------------------------\n\n
       `;
-      throw new Error(msg);
-    }
+          throw new Error(msg);
+        }
 
-    data = await page.pdf(opts.pdf);
-  } catch (err) {
-    logger.error(`Error when rendering page: ${err}`);
-    logger.error(err.stack);
-    throw err;
-  } finally {
-    logger.info('Closing browser..');
-    if (!config.DEBUG_MODE) {
-      await browser.close();
-    }
-  }
+        data = await page.pdf(opts.pdf);
+      } catch (err) {
+        logger.error(`Error when rendering page: ${err}`);
+        logger.error(err.stack);
+        throw err;
+      } finally {
+        logger.info('Closing browser..');
+        if (!config.DEBUG_MODE) {
+          await myPool.release(browser);
+        }
+      }
 
-  return data;
+      return data;
+
+    })
+    .catch((err) => {
+      // handle error - this is generally a timeout or maxWaitingClients
+      // error
+    });
 }
 
 async function scrollPage(page) {
